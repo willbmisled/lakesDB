@@ -1,0 +1,32 @@
+
+The following link will open the formatted text version of this Rmarkdown file in a browser:   
+> https://github.com/willbmisled/LakesDB/blob/master/data/joinMRB1_V1V2.md  
+
+The data can be loaded into R with the following code:  
+> load(url('https://raw.github.com/willbmisled/LakesDB/master/data/joinMRB1_V1V2.rda')
+    
+
+Data Definitions 
+-------------------------
+joinMRB1_V1V2 is a data frame with 28136 obs. and 4 variables
+
+**joinMRB1_V1V2 Data Definitions:**
+
+**Field**  | **Definition**
+------------- | ------------- 
+**WBID_V1** | Waterbody ID for NHDplus V1 lakes (same as V1\$WB_ID)
+**WBID_V2** | Waterbody ID for NHDplus V2 lakes (same as V1\$COMID)
+**flag**  | Indicates that the there may be differences in how V1 and V2 represent the lake (see below)
+**comment** | additional information on the lake or the flag
+
+**joinMRB1_V1V2 flag Definitions:**
+
+**Flag**  | **Definition**
+------------- | ------------- 
+flag==0 | Lakes Colocated with equal areas; Note: WBIDs may be the same or different in V1 and V2
+flag==1 | Single Lake in V1 split into two or more lakes in V2
+flag==2 | Multiple Lakes in V1 represented as a single lake in V2
+flag==3 | Lakes collocated but areas unequal
+flag==4 | In V1 but not V2
+flag==5 | In V2 but not V1
+flag==6 | V2 Duplicate lake; V2_166421080=V2_19333669=V1_19333669

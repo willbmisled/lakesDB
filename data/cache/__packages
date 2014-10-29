@@ -1,0 +1,11 @@
+base
+ggmap
+ggplot2
+knitr
+mapproj
+maps
+maptools
+rgdal
+rgeos
+RgoogleMaps
+sp

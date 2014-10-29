@@ -1,0 +1,972 @@
+A table to join the Waterbody IDs (WBID) for lakes in MRB1 (HUC01 and HUC02) from NHDplus Version 1 and 2
+========================================================
+<!---
+use these command instead of the knit icon if you want the data and work loaded into the R workspace
+  library(knitr)
+      a<-getwd()
+        if(substr(a,nchar(a)-6,nchar(a))=='lakesDB')  {setwd('./data/')
+          } else {if(substr(a,nchar(a)-3,nchar(a))!='data') print('WARNING: Wrong Working Directory')}
+  knit('joinMRB1_V1V2.rmd')
+-->
+Introduction:
+-------------------------
+* We have two versions of the lakes of MRB1 (Major River Basin 1: HUC regions 01 and 02) from NHDplus.  
+* Need to compare the two version to see if the WB_IDs (unique identifiers), lake locations, and areas match.  
+* The output is a table (joinMRB1_V1B2) that crosswalks the WB_IDs from one version to the other.
+* This document shows the details of the data comparisons and the creation of the join table.
+
+The following link will open the formatted text version of this Rmarkdown file in a browser:   
+> https://github.com/willbmisled/LakesDB/blob/master/data/joinMRB1_V1V2.md  
+
+The data can be loaded into R with the following code:  
+> load(url('https://raw.github.com/willbmisled/LakesDB/master/data/joinMRB1_V1V2.rda')
+    
+
+Data Definitions 
+-------------------------
+joinMRB1_V1V2 is a data frame with 28136 obs. and 4 variables
+
+**joinMRB1_V1V2 Data Definitions:**
+
+**Field**  | **Definition**
+------------- | ------------- 
+**WBID_V1** | Waterbody ID for NHDplus V1 lakes (same as V1\$WB_ID)
+**WBID_V2** | Waterbody ID for NHDplus V2 lakes (same as V1\$COMID)
+**flag**  | Indicates that the there may be differences in how V1 and V2 represent the lake (see below)
+**comment** | additional information on the lake or the flag
+
+**joinMRB1_V1V2 flag Definitions:**
+
+**Flag**  | **Definition**
+------------- | ------------- 
+flag==0 | Lakes Colocated with equal areas; Note: WBIDs may be the same or different in V1 and V2
+flag==1 | Single Lake in V1 split into two or more lakes in V2
+flag==2 | Multiple Lakes in V1 represented as a single lake in V2
+flag==3 | Lakes collocated but areas unequal
+flag==4 | In V1 but not V2
+flag==5 | In V2 but not V1
+flag==6 | V2 Duplicate lake; V2_166421080=V2_19333669=V1_19333669
+
+
+
+```{r loadPkgs, include=FALSE, echo=FALSE, cache=TRUE}
+  options(stringsAsFactors = FALSE, scipen=9) 
+
+  #check working directory
+      a<-getwd()
+        if(substr(a,nchar(a)-6,nchar(a))=='lakesDB')  {setwd('./data/')
+          } else {if(substr(a,nchar(a)-3,nchar(a))!='data') print('WARNING: Wrong Working Directory')}
+
+  #function to install (if needed) and load R packages by list
+    libs<-c('rgdal','rgeos','sp','maptools','RgoogleMaps','ggplot2','ggmap') #list of packages to load
+  
+    installLoad<-function(pck)#user defined function
+    {
+      if(!pck%in%installed.packages()){install.packages(pck,repos="http://rweb.quant.ku.edu/cran/")}
+      require(pck, character.only = TRUE)
+    }
+  
+    lapply(libs,function(x) installLoad(x))  #Load/Install require packages
+```
+
+```{r loadData, include=FALSE, echo=FALSE, cache=TRUE}
+#create spatial polygons dataframes V1 (original MRB1 lakes) and V2 (Morho lakes)
+#Read the NHDplusV2 lake morpho shapefile for HUC 01.  
+  HUC01<-readOGR('C:/Bryan/EPA/Data/LakesDatabase/LakeMorpho/ne01lakemorpho.shp',
+                 layer='ne01lakemorpho')
+  #get shapefile info
+    #list slots
+      getSlots(class(HUC01))
+    #show projection info
+      proj4string(HUC01)
+      #this is the ESRI "North_America_Albers_Equal_Area_Conic" projection
+        #save the projection
+          Albers<-CRS(proj4string(HUC01))
+
+#Read the NHDplusV2 lake morpho shapefile for HUC 02.  
+  HUC02<-readOGR('C:/Bryan/EPA/Data/LakesDatabase/LakeMorpho/ma02lakemorpho.shp',
+                 layer='ma02lakemorpho')
+
+#V2:  rbind HUC01 and HUC02
+  #need to change FIDs first
+    HUC01<-spChFIDs(HUC01, as.character(HUC01$COMID))
+    HUC02<-spChFIDs(HUC02, as.character(HUC02$COMID))
+  #rbind
+    V2<-spRbind(HUC01,HUC02)
+  #Associate lake holes (islands) with the correct polygon.  
+    slot(V2, "polygons") <- lapply(slot(V2, "polygons"), checkPolygonsHoles)
+
+
+#V1:  Read NHDplusV1 WBIDLakes from WaterbodyDatabase.mdb
+  WBDBdir<-"C:/Bryan/EPA/Data/WaterbodyDatabase/"  #define the directory where the data are stored
+    # List feature classes in the geodatabase
+      ogrListLayers(dsn= file.path(WBDBdir, "WaterBodyDataBase.mdb"))
+    #read the WBIDLakes polygon features
+      V1<-readOGR(dsn= file.path(WBDBdir,"WaterBodyDataBase.mdb"),"MRB1_WBIDLakes")
+    #get feature info
+      #list slots
+        getSlots(class(V1))
+      #read first lines of attributes
+        head(V1@data)
+      #show projection info
+        proj4string(V1)
+        #this is the ESRI "GCS_North_American_1983" projection
+      #reproject to Albers
+        V1<-spTransform(V1,Albers)   
+      #Associate lake holes (islands) with the correct polygon.  
+          slot(V1, "polygons") <- lapply(slot(V1, "polygons"), checkPolygonsHoles)
+
+```
+
+```{r functions, include=FALSE, echo=FALSE, cache=TRUE}
+#function to overlay one spdf on another and extract matching indices
+    fOver<-function(One,Two){ #One & Two are the spatial objects
+      a<-over(One, Two, returnList = TRUE) #run overlay
+      Max<-length(unlist(a))+length(a)  #get max length for output df
+      out<-data.frame(One=rep(NA,Max),Two=rep(NA,Max)) #create df for output
+      w<-0   #counter for output df row
+      #start loop to deconstruct the list
+        for(i in c(1:length(a))){ 
+          if(length(a[[i]])==0){
+            w<-w+1
+            out[w,]<-(c(i,NA))
+          } else { 
+            for(j in c(1:length(a[[i]]))){ 
+              w<-w+1
+              out[w,]<-(c(i,a[[i]][j]))
+            }}}
+      out<-subset(out,!is.na(out[,1])) #remove missing values
+      return(out)
+    }
+
+#Function to map the lakes by version and WBID for mapLakes (subfunction for makeMaps below)
+  showLake<-function(Vnum='V1',mapLakes){
+    #subset data by version (Vnum)
+      a<-subset(mapLakes,mapLakes$Source==Vnum)
+    #plot by WBID
+      ggplot(a) + 
+        aes(long,lat,group=group,fill=as.character(WBID)) + 
+        geom_polygon() +
+        geom_path(color="white") +
+        coord_equal() +
+        scale_fill_brewer(paste("WBID",Vnum))
+   } 
+    
+#Function to subset chkLakes by row number and make maps
+  makeMap<-function(Rows=c(1:2),Zoom=14){
+    library(ggmap) #even though this is already set knitr doesn't seem to find it.  Sloppy fix.
+    getWBID<-na.exclude(unique(c(chkV1V2[Rows,'WBID_V1'],chkV1V2[Rows,'WBID_V2'])))
+    keep<-chkLakes$WBID%in%getWBID  #;table(keep) #21
+      mapLakes<-chkLakes[keep,]
+    #get google map
+      Center<-apply(bbox(mapLakes),1,mean)
+          map<-ggmap(get_googlemap(center=Center,
+                         zoom=Zoom, 
+                         maptype='satellite', #also hybrid/terrain/roadmap
+                         scale = 2), #resolution scaling, 1 (low) or 2 (high)
+           size = c(600, 600), #size of the image to grab
+           extent='device', #can also be "normal" etc
+           darken = 0) #you can dim the map when plotting on top
+      #add the lake outlines
+        LM<-map + geom_polygon(aes(x=long, y=lat, group=group), 
+                        fill='grey', size=1,color='blue', data=mapLakes, alpha=0)
+      #add map to output list
+        out<-list(LM)
+  #prepare polygon data for plotting
+      mapLakes@data$id = rownames(mapLakes@data)  #add ID field
+      mapLakes.points = fortify(mapLakes, region="id") #convert to a standard data frame containing vertices
+      mapLakes= merge(mapLakes.points, mapLakes@data, by="id") #add attibute data
+  #get the maps lakes by version and WBID
+    LV1<-showLake('V1',mapLakes)
+    LV2<-showLake('V2',mapLakes)
+  #add to output
+    out<-list(LM,LV1,LV2)
+  return(out)
+}
+
+
+#Function to plot the maps created with makeMap
+  showMaps<-function(Rows=c(1:2),Zoom=12){
+    Maps<-makeMap(Rows,Zoom)
+      plot(Maps[[2]])
+      plot(Maps[[3]])
+      plot(Maps[[1]])
+  }
+
+#Function search for lakes in the vicinity of another
+  #find a lake in V1 or V2
+  #increase axes scale around the lake by a scaling percentage
+  #find lakes in other version within the bounding box
+  #plot results
+      #' Version 1='V1' 2='V2'
+      #' WBID = WBID of lake to plot
+      #' Scale = scaling fraction for xlim and ylim; 1.0=100%
+  plotVicinity<-function(Version=1,WBID=4782861,Scale=1.0){
+    #get lake
+      if(Version==1){
+        lake<-V1[V1@data$WB_ID==WBID,]
+        Look<-V2
+        }
+      if(Version==2){ 
+        lake<-V2[V2@data$COMID==WBID,]
+        Look<-V1
+        }
+    #plot lake for version and lakes for the other version
+      #set xlim and ylim based on the zoom factor
+        bb<-bbox(lake) #bounding box for lake
+        dx<-(bb[1,2]-bb[1,1])*Scale
+        dy<-(bb[2,2]-bb[2,1])*Scale
+        Xlim<-c(bb[1,1]-dx,bb[1,2]+dx)
+        Ylim<-c(bb[2,1]-dy,bb[2,2]+dy)
+      #plot lake and vicinity
+        plot(lake,border='red',lwd=3,xlim=Xlim,ylim=Ylim) #plot lake
+          title(paste('Version =',Version,'WBID =',WBID,'Shown in Red')) 
+        plot(Look,add=TRUE,col='blue',border=NA) #plot lakes in the vicinity
+  }
+      
+#Function plot a lake on a google map
+  #find a lake in V1 or V2
+  #show lake on google map
+      #' Version 1='V1' 2='V2'
+      #' WBID = WBID of lake to plot
+      #' Zoom = Google map zoom factor
+  plotGmap<-function(Version=1,WBID=4782861,Zoom=12){
+    library(rgdal) #even though this is already set knitr doesn't seem to find it.  Sloppy fix.
+    #get lake
+      if(Version==1) lake<-V1[V1@data$WB_ID==WBID,]
+      if(Version==2) lake<-V2[V2@data$COMID==WBID,]
+    #reproject to match googlemaps
+      lake<-spTransform(lake,CRS("+proj=longlat +datum=WGS84")) 
+          #get google map
+            Center<-apply(bbox(lake),1,mean)
+                map<-ggmap(get_googlemap(center=Center,
+                               zoom=Zoom, 
+                               maptype='satellite', #also hybrid/terrain/roadmap
+                               scale = 2), #resolution scaling, 1 (low) or 2 (high)
+                 size = c(600, 600), #size of the image to grab
+                 extent='device', #can also be "normal" etc
+                 darken = 0) #you can dim the map when plotting on top
+            #prepare polygon data for plotting
+              lake@data$id = rownames(lake@data)  #add ID field
+              lake.points = fortify(lake, region="id") #convert to a standard data frame containing vertices
+              lake= merge(lake.points, lake@data, by="id") #add attibute data
+            #Plot map with lake 
+              map + geom_polygon(aes(x=long, y=lat, group=group), 
+                              size=1,color='red', data=lake, alpha=0) + 
+                              ggtitle(paste('Version =',Version,'WBID =',WBID,'Shown in Red')) + 
+                              theme(plot.title = element_text(lineheight=.8, face="bold"))
+  }
+```
+
+Data
+-------------------------
+*  Load the NHD HUC01 & 02 lakes (MRB1) based on NHDplus Version 1. 
+*  Reproject to Albers
+*  Associate lake holes with correct polygon
+*  Save as SpatialPolygonsDataFrame "V1"
+
+Here are the first few lines of the V1 attribute data: 
+```{r headV1, include=TRUE, echo=FALSE, cache=TRUE}
+    head(V1@data)
+```
+**Note:**  for V1 the only important attribute (for now) is the WB_ID.  This is the unique id for the lake
+
+*  Load the NHD HUC01 lakes based on NHDplus Version 2.
+*  Load the NHD HUC02 lakes based on NHDplus Version 2.
+*  Combine HUC01 and HUC02
+*  Associate lake holes with correct polygon
+*  Save as SpatialPolygonsDataFrame "V2"
+
+Here are the first few lines of the V2 attribute data: 
+```{r headV2, include=TRUE, echo=FALSE, cache=TRUE}
+    head(V2@data)
+```
+**Note:**  for V2 the only attribute is the COMID.  This is the unique id for the lake and should match V1$WB_ID
+
+```{r compV1_V2, include=FALSE, echo=FALSE, cache=TRUE}
+  #calculate the areas by NHD version
+    #get the Version 1 area
+      V1area<-data.frame(WBID=V1$WB_ID,areaV1=gArea(V1,byid=TRUE))
+    #get the Version 2 area
+      V2area<-data.frame(WBID=V2$COMID,areaV2=gArea(V2,byid=TRUE))
+  #compare areas by WBID
+    comp<-merge(V1area,V2area,by='WBID',all=T)
+      #verify that all WBIDs were included
+        nrow(V1@data)                           #   28122
+          table(V1@data$WB_ID%in%comp$WBID) #TRUE = 28122 
+        nrow(V2@data)                                #   28130
+          table(V2@data$COMID%in%comp$WBID)      #TRUE = 28130
+      #check for missing values    
+        table(is.na(comp$areaV1))  #missing values = 305
+        table(is.na(comp$areaV2))  #missing values = 297
+      #calculate difference in area for polygons with the same WBID
+        comp$perDif<-abs(round((comp$areaV1-comp$areaV2)/comp$areaV1,2))
+        table(comp$perDif>0)  ##areas are different for 6 WBIDs
+      #create a list of WBIDs to check
+        chk<-subset(comp$WBID,comp$perDif>0|is.na(comp$areaV1)|is.na(comp$areaV2)) ;length(chk) #608
+      #flag WBIDs to check; Note if flag=0 than WBID is the same in V1 and V2
+        comp$flag<-0
+        comp$flag[comp$WBID%in%chk]<-1
+        table(comp$flag,useNA='ifany')  #No flag=27819; Flag = 608; missing: V1=305; V2=297; Area mismatch=6
+#Start crosswalk list WBID in V1 and V2
+  a<-comp[comp$flag==0,]
+  joinMRB1_V1V2<-data.frame(cbind(WBID_V1=a$WBID,WBID_V2=a$WBID))
+    joinMRB1_V1V2$flag<-0  #no flag for row.  
+    joinMRB1_V1V2$comment<-'Same Lake; WBID_V1==WBID_V2 and lake areas match' #N=27819
+#need to match unmatched WBID to lakes
+  #create spdf to check
+    #version 1
+      keep<-V1$WB_ID%in%chk;table(keep)  #303 lakes that match chk (297 missing + 6 area dif)
+      chkV1<-V1[keep,]  #subset data
+        #writeOGR(chkV1,getwd(),'chkV1', driver="ESRI Shapefile") #write to shapefile
+    #version 2
+      keep<-V2$COMID%in%chk;table(keep)  #311 lakes that match chk (305 missing + 6 area dif)
+      chkV2<-V2[keep,]  #subset data
+        #writeOGR(chkV2,getwd(),'chkV2', driver="ESRI Shapefile") #write to shapefile
+
+  #Use overlay function to match V1 flagged lakes to V2 flagged lakes
+    #overlay V1 on V2 and extract the WBID matches
+      chkV1V2<-fOver(chkV1,chkV2)
+        nrow(chkV1V2)  #313
+        length(unique(chkV1V2$One)) #303
+    #overlay V2 on V1 and extract the WBID matches
+      chkV2V1<-fOver(chkV2,chkV1)
+        nrow(chkV2V1)  #313
+        length(unique(chkV2V1$One)) #311
+  
+
+#combine overlays to generate list of WBID matches V1 and V2
+      a<-data.frame(WBID_V1=chkV1$WB_ID[chkV1V2$One],WBID_V2=chkV2$COMID[chkV1V2$Two]) #nrow=313
+      b<-data.frame(WBID_V1=chkV1$WB_ID[chkV2V1$Two],WBID_V2=chkV2$COMID[chkV2V1$One]) #nrow=313
+      matchV1V2<-unique(rbind(a,b))
+        nrow(matchV1V2) #317
+      #check to make sure all flagged WBIDs are included
+        table(V1$WB_ID%in%matchV1V2$WBID_V1) #True=303
+        table(V2$COMID%in%matchV1V2$WBID_V2) #True=311
+  #get counts for WBID's-check for multiple listings\
+    #V2
+      count2<-data.frame(table(matchV1V2$WBID_V2)) 
+        names(count2)<-c('WBID_V2','nV2')
+          nrow(count2) #311
+        matchV1V2<-merge(matchV1V2,count2,by='WBID_V2',all=T)
+          nrow(matchV1V2) #317
+    #V1
+      count1<-data.frame(table(matchV1V2$WBID_V1)) 
+        names(count1)<-c('WBID_V1','nV1')
+          nrow(count1) #303
+        matchV1V2<-merge(matchV1V2,count1,by='WBID_V1',all=T)
+          nrow(matchV1V2) #317
+    #add flag for multiple WBID entries
+      matchV1V2$flagWBID<-ifelse(matchV1V2$nV1+matchV1V2$nV2==2,0,1)
+      matchV1V2$flagWBID[is.na(matchV1V2$flagWBID)]<-2
+        table(matchV1V2$flagWBID,useNA='ifany') 
+            #matchV1V2$flagWBID==0 count=287 1 WBID_V1 corresponds to 1 WBID_V2; no problems
+            #matchV1V2$flagWBID==1 count=22 multiple WBID in V1 or V2 for a single lake in other version
+            #matchV1V2$flagWBID==2 count=8 WBID missing in V1 or V2 
+    #add the area data to matchV1V2
+      matchV1V2<-merge(matchV1V2,V1area,by.x='WBID_V1',by.y='WBID',all.x=TRUE)
+      matchV1V2<-merge(matchV1V2,V2area,by.x='WBID_V2',by.y='WBID',all.x=TRUE)
+        nrow(matchV1V2) #317
+    #calculate difference in area for polygons with the same location
+      matchV1V2$perDif<-abs(round((matchV1V2$areaV1-matchV1V2$areaV2)/matchV1V2$areaV1,2))
+    #flag Areas to check; Note if flag=0 than areas match
+          matchV1V2$flagArea<-ifelse(matchV1V2$perDif>0,1,0)
+          matchV1V2$flagArea[is.na(matchV1V2$flagArea)]<-2 #one or more area missing=identified in flagWBID
+            table(matchV1V2$flagArea,useNA='ifany') 
+              #matchV1V2$flagArea==0 count=282   areas match (more or less)
+              #matchV1V2$flagArea==1 count=27    areas don't match
+              #matchV1V2$flagArea==2 count=8     WBID missing in V1 or V2 
+    #add overall flag for flagArea+flagWBID>0
+      matchV1V2$flag<-ifelse(matchV1V2$flagWBID>0|matchV1V2$flagArea>0,1,0)
+          table(matchV1V2$flag,matchV1V2$flagArea)
+              #matchV1V2$flag==0 count=282   lakes colocated and areas match (more or less)
+              #matchV1V2$flag==1 count=27    multiple lakes or areas don't match
+              #matchV1V2$flag==2 count=8     WBID missing in V1 or V2 
+    #add matchV1V2$flag==0 WBIDs to joinMRB1_V1V2
+          nrow(joinMRB1_V1V2)  #27819
+      a<-matchV1V2[matchV1V2$flag==0,c('WBID_V1','WBID_V2')]
+        a$flag<-0  #no flag for row.  
+        a$comment<-'Same lake different WBIDs; Lakes colocated with equal area'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)
+          nrow(joinMRB1_V1V2)  #27819+282=28101
+    #add matchV1V2$flag>0 WBIDs to list to check visually.
+      chkV1V2<-matchV1V2[matchV1V2$flag!=0,c(2,1,4,3,5:10)]
+        nrow(chkV1V2)  #35
+
+#Create a spatialpolygons data.frame with the lakes from chkV1V2; reproject to WGS84
+      table(V1$WB_ID%in%joinMRB1_V1V2$WBID_V1) #21 lakes to check in V1
+    keep<-V1$WB_ID%in%unique(chkV1V2$WBID_V1);table(keep) #21
+      a<-V1[keep,'WB_ID'] #get the lakes; keep WB_ID
+      names(a)<-'WBID'  #rename WB_ID to WBID
+      a$Source<-'V1' #add Source
+  #Get the lakes to check from V2
+      table(V2$COMID%in%joinMRB1_V1V2$WBID_V2) #29 lakes to check in V2
+    keep<-V2$COMID%in%unique(chkV1V2$WBID_V2);table(keep) #29
+      b<-V2[keep,] #get the lakes; 
+      names(b)<-'WBID' #rename COMID to WBID
+      b$Source<-'V2' #add Source      
+  #spRbind lakes to check and reproject
+    chkLakes<-spRbind(a,b)
+      table(chkLakes$Source) #21 & 29
+        chkLakes<-spTransform(chkLakes,CRS("+proj=longlat +datum=WGS84")) #reproject to match googlemaps
+  #reorder and sort chkV1V2
+    a<-subset(chkV1V2,chkV1V2$nV1>1)      #multiple v1 lakes
+      a<-a[order(a$WBID_V1,a$WBID_V2),]
+    b<-subset(chkV1V2,chkV1V2$nV2>1)      #multiple v2 lakes
+      b<-b[order(b$WBID_V2,b$WBID_V1),]
+    y<-subset(chkV1V2,chkV1V2$flagWBID==0)  #colocated lakes with area differences
+      y<-y[order(y$WBID_V1,y$WBID_V2),]
+    x<-subset(chkV1V2,is.na(chkV1V2$nV1)|is.na(chkV1V2$nV2)) #missing lakes
+      x<-x[order(x$WBID_V2,x$WBID_V1),]
+    chkV1V2<-rbind(a,b,y,x)
+      row.names(chkV1V2)<-1:nrow(chkV1V2)
+        nrow(chkV1V2)  #35
+``` 
+Compare V1 and V2
+-------------------------
+
+WBID is the unique ID for the Waterbody.  This was derived from the NHDplus COMID.  The lakes files use different naming conventions in V1 the WBID is V1\$WB_ID.  For V2 it is V2\$COMID.  Both files are in the Albers projection.
+
+Comparison Steps:
+* calculate lake areas for V1 and V2
+* merge the WBIDs and Areas for V1 and V2
+* lakes with whose WBID and Area match are considered to be the same lake.  
+* A dataframe (joinMRB1_V1V2) is created with the matching that maps the WBIDs for V1 to those in V2.
+* The "over" function from the "sp" package used to spatially join the lakes in V1 that are not matched in V2 (and vice versa).
+* This provides a list of potential V1/V2 WBID matches
+* area is merged to this list and lakes whose areas and locations match are considered to be the same lake with different WBIDs.  These WBIDs are added to joinMRB1_V1V2
+* This leaves a data.frame (chkV1V2) with information on lakes that need to be checked graphically.
+* The list includes:
+  1. Lakes in one Version that do not overlay lakes in the other version.  These could be lakes that were undetected in one version or were determined not to be lakes.
+  2. Lakes whose positions overlap but the areas don't match.  In most cases one version of NHDplus divided the lakes differently than the other version (i.e. V1 shows 1 lake while V2 shows 2 lakes)
+*The lakes listed in chkV1V2 were used to create the SpatialPolygonsDataFrame "chkLakes".  This was reprojected to WGS84 to match googlemaps  
+ 
+**These are the lakes that need to be verified:**
+```{r chkV1V2, include=TRUE, echo=FALSE, cache=TRUE}
+    chkV1V2[,-10]
+```
+
+Visually check the flagged lakes with colocated matches
+-------------------------
+* ChkV1V2 sorted by WBID_V1 and WBID_V2
+* From the list choose the row numbers of lakes that appear as a single lake in one version and multiple lakes in another and plot them.
+* lakes plotted first by version then as an overlay on a google map.
+* Visually check the plots and decide how to resolve the differences
+* Update joinMRB1_V1V2
+
+* `r Rows=c(1,2);Zoom<-14`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r options(scipen=9);unique(chkV1V2[Rows,'WBID_V2'])`)  
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+
+```{r Rows1,2, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into two lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(3,4);Zoom<-13`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+
+```{r Rows3,4, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into two lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+* `r Rows<-c(5,6);Zoom<-13`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+
+```{r Rows5,6, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into two lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(7,8);Zoom<-16`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+
+```{r Rows7,8, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into two lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+   
+```
+
+* `r Rows<-c(9,10);Zoom<-13`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+
+```{r Rows9,10, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into two lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(11:13);Zoom<-10`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+
+```{r Rows11,13, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into three lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(14,15);Zoom<-14`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+
+```{r Rows14,15, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into two lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(16:18);Zoom<-16`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=1 indicating a single lake in V1 maps to multiple lake in V2
+                                     
+
+```{r Rows16,18, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-1  #flag for row.  
+        a$comment<-'Single Lake in V1 split into three lakes in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(19:20);Zoom<-11`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=2 indicating multiple lakes in V1 map to a single lake in V2
+
+```{r Rows19,20, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-2  #flag for row.  
+        a$comment<-'Two Lakes in V1 represented as a single lake in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(21:22);Zoom<-17`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates they are contiguous and could be joined or separate.
+* Add WBIDs to joinMRB1_V1V2 with flag=2 indicating multiple lakes in V1 map to a single lake in V2
+
+```{r Rows21,22, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-2  #flag for row.  
+        a$comment<-'Two Lakes in V1 represented as a single lake in V2'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+    
+```
+
+* `r Rows<-c(23);Zoom<-12`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates that V1 and V2 have different views of this lake.
+* From the googlemap image it looks like it isn't really a lake or a small one.
+* The V2 lake (WBID==166174730) is much larger than the V1 lake (WBID=6094729)
+* When plotted together it is clear that the V1 lake is a tiny spot on the south end of V2
+* Add WBIDs to joinMRB1_V1V2 with flag=3 and the comment: Lakes collocated but areas unequal
+
+```{r Rows23, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-3  #flag for row.  
+        a$comment<-'Lakes collocated but areas unequal'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag  
+```
+
+```{r Rows23a, include=TRUE, echo=FALSE, cache=TRUE}
+    par(mfrow=c(1,2))
+    plot(V2[V2$COMID==166174730,],col='blue',axes=TRUE)
+      plot(V1[V1$WB_ID==6094729,],col='red',axes=TRUE,add=TRUE,border=NA)
+        title('V2 166174730 in Blue and V1 6094729 in Red')
+    plot(V1[V1$WB_ID==6094729,],col='red',axes=TRUE)
+    
+```
+
+* `r Rows<-c(24);Zoom<-16`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates that V1 and V2 have different views of this lake.
+* From the googlemap image it looks like the V2 is a much better representation of the lake.
+* The V2 lake (WBID==931050002) is much larger than the V1 lake (WBID=6710763)
+* When plotted together it is clear that the V1 lake is a portion of V2
+* Add WBIDs to joinMRB1_V1V2 with flag=3 and the comment: Lakes collocated but areas unequal
+
+```{r Rows24, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-3  #flag for row.  
+        a$comment<-'Lakes collocated but areas unequal'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+```
+
+```{r Rows24a, include=TRUE, echo=FALSE, cache=TRUE}
+    par(mfrow=c(1,2))
+    plot(V2[V2$COMID==931050002,],col='blue',axes=TRUE)
+      plot(V1[V1$WB_ID==6710763,],col='red',axes=TRUE,add=TRUE,border=NA)
+        title('V2 931050002 in Blue and V1 6710763 in Red')
+    plot(V1[V1$WB_ID==6710763,],col='red',axes=TRUE)
+    
+```
+
+* `r Rows<-c(25);Zoom<-12`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates that V1 and V2 have different views of this lake.
+* From the googlemap image it looks like the V2 is a much better representation of the lake.
+* The V2 lake (WBID==166174267) is much larger than the V1 lake (WBID=6732123)
+* When plotted together it is clear that the V1 lake is a portion of V2
+* Add WBIDs to joinMRB1_V1V2 with flag=3 and the comment: Lakes collocated but areas unequal
+
+```{r Rows25, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-3  #flag for row.  
+        a$comment<-'Lakes collocated but areas unequal'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+```
+
+```{r Rows25a, include=TRUE, echo=FALSE, cache=TRUE}
+    par(mfrow=c(1,2))
+    plot(V2[V2$COMID==166174267,],col='blue',axes=TRUE)
+      plot(V1[V1$WB_ID==6732123,],col='red',axes=TRUE,add=TRUE,border=NA)
+        title('V2 166174267 in Blue and V1 6732123 in Red')
+    plot(V1[V1$WB_ID==6732123,],col='red',axes=TRUE)
+    
+```
+
+* `r Rows<-c(26);Zoom<-12`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates that V1 and V2 have different views of this lake.
+* From the googlemap image it looks like the V2 is a much better representation of the lake.
+* The V2 lake (WBID==931070002) is much larger than the V1 lake (WBID=6760548)
+* When plotted together it is clear that the V1 lake is a portion of V2
+* Add WBIDs to joinMRB1_V1V2 with flag=3 and the comment: Lakes collocated but areas unequal
+
+```{r Rows26, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-3  #flag for row.  
+        a$comment<-'Lakes collocated but areas unequal'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+```
+
+```{r Rows26a, include=TRUE, echo=FALSE, cache=TRUE}
+    par(mfrow=c(1,2))
+    plot(V2[V2$COMID==931070002,],col='blue',axes=TRUE)
+      plot(V1[V1$WB_ID==6760548,],col='red',axes=TRUE,add=TRUE,border=NA)
+        title('V2 931070002 in Blue and V1 6760548 in Red')
+    plot(V1[V1$WB_ID==6760548,],col='red',axes=TRUE)
+    
+```
+
+* `r Rows<-c(27);Zoom<-16`For **chkV1V2[c(`r Rows`),]** 
+  * WBID_v1=c(`r unique(chkV1V2[Rows,'WBID_V1'])`)
+  * WBID_v2=c(`r unique(chkV1V2[Rows,'WBID_V2'])`)
+* Plotting the lakes (see below) indicates that V1 and V2 have different views of this lake.
+* From the googlemap image it looks like the V2 is a much better representation of the lake.
+* The V2 lake (WBID==8390908) is much larger than the V1 lake (WBID=8390908)
+* When plotted together it is clear that the V1 lake is a portion of V2
+* Add WBIDs to joinMRB1_V1V2 with flag=3 and the comment: Lakes collocated but areas unequal
+
+```{r Rows27, include=TRUE, echo=FALSE, cache=TRUE}
+    showMaps(Rows,Zoom)  #make the plots
+  #add Rows to joinMRB1_V1V2
+      a<-chkV1V2[Rows,c('WBID_V1','WBID_V2')]
+        a$flag<-3  #flag for row.  
+        a$comment<-'Lakes collocated but areas unequal; V2 missing part of lake'
+      joinMRB1_V1V2<-rbind(joinMRB1_V1V2,a)  #add to joinMRB1_V1V2 with flag
+```
+
+```{r Rows27a, include=TRUE, echo=FALSE, cache=TRUE}
+    par(mfrow=c(1,2))
+    plot(V1[V1$WB_ID==8390908,],col='red',axes=TRUE)
+      title('V1 8390908')
+    plot(V1[V1$WB_ID==8390908,],col=NA,border=NA,axes=TRUE)
+      plot(V2[V2$COMID==8390908,],col='blue',axes=TRUE,add=TRUE,border=NA,lwd=5)
+        title('V2 8390908')
+  
+```
+
+```{r 27b, include=TRUE, echo=FALSE, cache=TRUE}
+      par(mfrow=c(1,1))
+          plotVicinity(2,8390908,1)
+```
+
+Visually check the lakes without matches in the other version
+-------------------------
+
+* Four lakes present in V1 not present in V2
+* Four lakes present in V2 not present in V1
+
+```{r missingLakes, include=TRUE, echo=FALSE, cache=TRUE}
+     chkV1V2[is.na(chkV1V2$WBID_V1)|is.na(chkV1V2$WBID_V2),]
+    
+```
+* Plot lake of interest
+* Adjust xlim and ylim to an area around the lake
+* Plot lakes for the other Version that are in the same vicinity
+* Plot lake on google map to see what it looks like
+* View plots and resolve the differences.
+* Update joinMRB1_V1V2
+
+The missing lakes-6 of 8
+-------------------------
+* Six of the eight lakes are easily resolved.  
+* They just aren't represented in the other version
+* These are shown in the plots
+
+
+```{r a1, include=TRUE, echo=FALSE, cache=TRUE}
+          plotVicinity(1,4782861,.5)
+```
+
+```{r a2, include=TRUE, echo=FALSE, cache=TRUE}
+          plotGmap(1,4782861,Zoom=12) 
+```
+
+```{r a3, include=TRUE, echo=TRUE, cache=TRUE}
+            Row<-nrow(joinMRB1_V1V2)+1 #row to add
+              joinMRB1_V1V2[Row,'WBID_V1']<-4782861
+              joinMRB1_V1V2[Row,'flag']<-4
+              joinMRB1_V1V2[Row,'comment']<-'In V1 but not V2.'
+```
+
+```{r c1, include=TRUE, echo=FALSE, cache=TRUE}
+          plotVicinity(1,22287527,.5)
+```
+
+```{r c2, include=TRUE, echo=FALSE, cache=TRUE}
+          plotGmap(1,22287527,Zoom=14) 
+```
+
+```{r c3, include=TRUE, echo=TRUE, cache=TRUE}
+            Row<-nrow(joinMRB1_V1V2)+1 #row to add
+              joinMRB1_V1V2[Row,'WBID_V1']<-22287527
+              joinMRB1_V1V2[Row,'flag']<-4
+              joinMRB1_V1V2[Row,'comment']<-'In V1 but not V2.'
+```
+
+```{r d1, include=TRUE, echo=FALSE, cache=TRUE}
+          plotVicinity(1,22287665,1)
+```
+
+```{r d2, include=TRUE, echo=FALSE, cache=TRUE}
+          plotGmap(1,22287665,Zoom=16) 
+```
+
+```{r d3, include=TRUE, echo=TRUE, cache=TRUE}
+            Row<-nrow(joinMRB1_V1V2)+1 #row to add
+              joinMRB1_V1V2[Row,'WBID_V1']<-22287665
+              joinMRB1_V1V2[Row,'flag']<-4
+              joinMRB1_V1V2[Row,'comment']<-'In V1 but not V2.'
+```
+
+```{r e1, include=TRUE, echo=FALSE, cache=TRUE}
+          plotVicinity(1,15516920,1)
+```
+
+```{r e2, include=TRUE, echo=FALSE, cache=TRUE}
+          plotGmap(1,15516920,Zoom=16) 
+```
+
+```{r e3, include=TRUE, echo=TRUE, cache=TRUE}
+            Row<-nrow(joinMRB1_V1V2)+1 #row to add  
+              joinMRB1_V1V2[Row,'WBID_V2']<-15516920
+              joinMRB1_V1V2[Row,'flag']<-5
+              joinMRB1_V1V2[Row,'comment']<-'In V2 but not V1.'
+```
+
+```{r f1, include=TRUE, echo=FALSE, cache=TRUE}
+          plotVicinity(2,15516922,1)
+```
+
+```{r f2, include=TRUE, echo=FALSE, cache=TRUE}
+          plotGmap(2,15516922,Zoom=16) 
+```
+
+```{r f3, include=TRUE, echo=TRUE, cache=TRUE}
+            Row<-nrow(joinMRB1_V1V2)+1 #row to add  
+              joinMRB1_V1V2[Row,'WBID_V2']<-15516922
+              joinMRB1_V1V2[Row,'flag']<-5
+              joinMRB1_V1V2[Row,'comment']<-'In V2 but not V1.'
+```
+
+```{r g1, include=TRUE, echo=FALSE, cache=TRUE}
+          plotVicinity(2,60444415,1)
+```
+
+```{r g2, include=TRUE, echo=FALSE, cache=TRUE}
+          plotGmap(2,60444415,Zoom=15) 
+```
+
+```{r g3, include=TRUE, echo=TRUE, cache=TRUE}
+            Row<-nrow(joinMRB1_V1V2)+1 #row to add  
+              joinMRB1_V1V2[Row,'WBID_V2']<-60444415
+              joinMRB1_V1V2[Row,'flag']<-5
+              joinMRB1_V1V2[Row,'comment']<-'In V2 but not V1.'
+```
+
+The missing lakes-the penultimate
+-------------------------
+* V1_WBID=10312598 is the southern edge of Lake Champlain (V1 and V2 WBID=22302965)
+* In the Waterbody database V1_WBID=10312598 is separate from V1_WBID=22302965 
+* When the overlay was done above V1_WBID=22302965 was matched to V2_WBID=22302965
+* The match between V1 and V2 WBID=22302965 joinMRB1_V1V2 was flagged and commented
+* A new entry in joinMRB1_V1V2 showing the link between V1_WBID=10312598 and V2_WBID=22302965 was added.
+* Here are the graphics for V1_WBID=10312598:
+
+  
+```{r b1, include=TRUE, echo=FALSE, cache=TRUE}
+    wbid<-10312598;scale<-2.5;version<-1;
+          plotVicinity(version,wbid,scale)
+```
+
+```{r b2, include=TRUE, echo=FALSE, cache=TRUE}
+          plotGmap(version,wbid,Zoom=10) 
+      #update original line in joinMRB1_V1V2
+        joinMRB1_V1V2[joinMRB1_V1V2$WBID_V1==22302965,'flag']<-2
+        joinMRB1_V1V2[joinMRB1_V1V2$WBID_V1==22302965,'comment']<-'Two Lakes in V1 represented as a single lake in V2'
+```
+
+```{r b3, include=TRUE, echo=FALSE, cache=TRUE}
+      #add new line to joinMRB1_V1V2
+        Row<-nrow(joinMRB1_V1V2)+1 #row to add
+          joinMRB1_V1V2[Row,'WBID_V1']<-10312598
+          joinMRB1_V1V2[Row,'WBID_V2']<-22302965
+          joinMRB1_V1V2[Row,'flag']<-2
+          joinMRB1_V1V2[Row,'comment']<-'Two Lakes in V1 represented as a single lake in V2'
+
+```
+
+The missing lakes-the ultimate
+-------------------------
+* The overlay did not find a match for V2_WBID=166421080 in V1
+* When V2_WBID=166421080 and  V1 lakes are plotted V2_WBID=166421080 is seen to be colocated with a V1 lakes
+```{r h1, include=TRUE, echo=FALSE, cache=TRUE}
+    wbid<-166421080;scale<-.5;version<-2;
+          plotVicinity(version,wbid,scale)
+```
+* When he HUC01 shapefile is opened in ArcMap there is no lake corresponding to  V2_WBID=166421080 in the attribute table.
+* V2_WBID=19333669,however, is in the same location.
+* Returning to R V2_WBID=19333669 and V2_WBID=166421080 are plotted and are clearly the same lake; in the same location and the areas match.
+* So this is what is happening.  Lake V2_WBID=166421080 and V2_WBID=19333669 are the same lake and one should be deleted.
+* V2_WBID=19333669 is also the same as V1_WBID=19333669
+* Need to update joinMRB1_V1V2 to reflect this adding a new flag code #5 to explain what happened.
+
+
+```{r h2, include=TRUE, echo=FALSE, cache=TRUE}
+  par(mfrow=c(1,2))
+    plot(HUC01[HUC01$COMID==166421080,],col='blue',axes=TRUE) #doesn't show up in esri
+      title('HUC01$COMID==166421080')
+      mtext(paste('Area = ',round(gArea(HUC01[HUC01$COMID==166421080,],byid=TRUE))),side=1,line=0)
+    plot(HUC01[HUC01$COMID==19333669,],col='red',axes=TRUE)  #this one shows up in esri
+      title('HUC01$COMID==19333669')
+      mtext(paste('Area = ',round(gArea(HUC01[HUC01$COMID==19333669,],byid=TRUE))),side=1,line=0)
+```
+
+```{r h3, include=TRUE, echo=FALSE, cache=TRUE}
+    #edit joinMRB1_V1V2
+      Comment<-'V2 Duplicate lake; V2_166421080=V2_19333669=V1_19333669'
+        joinMRB1_V1V2[which(joinMRB1_V1V2$WBID_V1==19333669),]
+        joinMRB1_V1V2[which(joinMRB1_V1V2$WBID_V1==19333669),'flag']<-6
+        joinMRB1_V1V2[which(joinMRB1_V1V2$WBID_V1==19333669),'comment']<-Comment
+    #add new line to joinMRB1_V1V2
+      Row<-nrow(joinMRB1_V1V2)+1 #row to add
+        joinMRB1_V1V2[Row,'WBID_V1']<-19333669
+        joinMRB1_V1V2[Row,'WBID_V2']<-166421080
+        joinMRB1_V1V2[Row,'flag']<-6
+        joinMRB1_V1V2[Row,'comment']<-Comment
+
+```
+
+QAQC-Check to make sure all V1 and V2 WBIDs are included in joinMRB1_V1V2
+-------------------------
+* All V1 and V2 WBIDs are in joinMRB1_V1V2
+
+```{r Q1, include=TRUE, echo=TRUE, cache=TRUE}
+table(V1$WB_ID%in%joinMRB1_V1V2$WBID_V1)
+table(V2$COMID%in%joinMRB1_V1V2$WBID_V2)
+```
+
+* Checking if all joinMRB1_V1V2 WBIDs are in V1 and V2 shows that for each Version 3 are missing
+* For each version 3 lakes are found in one version and not the next so the mis-matches are NAs.
+
+```{r Q2, include=TRUE, echo=TRUE, cache=TRUE}
+table(joinMRB1_V1V2$WBID_V1%in%V1$WB_ID)
+  joinMRB1_V1V2[which(joinMRB1_V1V2$WBID_V1%in%V1$WB_ID==FALSE),]
+table(joinMRB1_V1V2$WBID_V2%in%V2$COMID)
+  joinMRB1_V1V2[which(joinMRB1_V1V2$WBID_V2%in%V2$COMID==FALSE),]
+```
+
+Save the data
+-------------------------
+* joinMRB1_V1V2 saved to 'joinMRB1_V1V2.rda'
+
+```{r Save, include=FALSE, echo=FALSE, cache=TRUE}
+  #save the data
+    save(joinMRB1_V1V2,file='joinMRB1_V1V2.rda')
+```
+ 
